@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -85,6 +88,22 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong", err)
+		return
+	}
+
+	prefix := ""
+
+	if aspectRatio == "16:9" {
+		prefix = "landscape"
+	} else if aspectRatio == "9:16" {
+		prefix = "portrait"
+	} else {
+		prefix = aspectRatio
+	}
+
 	videoTypeSplit := strings.Split(mediaType, "/")
 	if len(videoTypeSplit) != 2 {
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong", errors.New("Couldn't split media type"))
@@ -94,7 +113,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	filename := make([]byte, 32)
 	rand.Read(filename)
 	encodedFileName := hex.EncodeToString(filename)
-	fileNameAndExtention := encodedFileName + "." + videoTypeSplit[1]
+	fileNameAndExtention := prefix + "/" + encodedFileName + "." + videoTypeSplit[1]
 
 	s3params := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
@@ -115,6 +134,48 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	if err := cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong", err)
 		return
+	}
+
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	var b bytes.Buffer
+	cmd.Stdout = &b
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	type Ratio struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+
+	type Streams struct {
+		Streams []Ratio `json:"streams"`
+	}
+
+	var ratioData Streams
+	if err := json.Unmarshal(b.Bytes(), &ratioData); err != nil {
+		return "", err
+	}
+
+	if len(ratioData.Streams) == 0 {
+		return "", errors.New("There is no data to get aspect ratio from")
+	}
+
+	width := ratioData.Streams[0].Width
+	height := ratioData.Streams[0].Height
+
+	aspectRatio := (width * 100) / height
+	if aspectRatio >= 176 && aspectRatio <= 178 {
+		return "16:9", nil
+	} else if aspectRatio >= 55 && aspectRatio <= 57 {
+		return "9:16", nil
+	} else {
+		return "other", nil
 	}
 
 }
